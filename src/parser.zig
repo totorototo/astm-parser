@@ -22,7 +22,6 @@ const visitCmd = types.visitCmd;
 
 pub const ParseError = error{
     InvalidFormat,
-    MissingHeader,
     InvalidNumber,
     UnexpectedToken,
     OutOfMemory,
@@ -32,38 +31,23 @@ pub const ParseError = error{
 
 pub const Parser = struct {
     allocator: std.mem.Allocator,
-    current_piece: ?*Piece = null,
-
-    polylines: std.ArrayListUnmanaged(Polyline) = .{},
-    arcs: std.ArrayListUnmanaged(Arc) = .{},
-    circles: std.ArrayListUnmanaged(Circle) = .{},
-    notches: std.ArrayListUnmanaged(Notch) = .{},
-    drill_holes: std.ArrayListUnmanaged(DrillHole) = .{},
-    annotations: std.ArrayListUnmanaged(TextAnnotation) = .{},
-    seam_lines: std.ArrayListUnmanaged(SeamLine) = .{},
 
     pub fn init(allocator: std.mem.Allocator) Parser {
-        return .{
-            .allocator = allocator,
-        };
+        return .{ .allocator = allocator };
     }
 
-    pub fn deinit(self: *Parser) void {
-        self.polylines.deinit(self.allocator);
-        self.arcs.deinit(self.allocator);
-        self.circles.deinit(self.allocator);
-        self.notches.deinit(self.allocator);
-        self.drill_holes.deinit(self.allocator);
-        self.annotations.deinit(self.allocator);
-        self.seam_lines.deinit(self.allocator);
-    }
+    pub fn deinit(_: *Parser) void {}
 
+    /// Parse ASTM D6673 input and dispatch to visitor methods.
+    ///
+    /// LIFETIME: string fields on Header, Marker, Piece, and TextAnnotation
+    /// (id, name, material, comment, text, etc.) are slices into `input` — they
+    /// are NOT heap-allocated copies. The caller must keep `input` alive for as
+    /// long as those values are in use.
     pub fn parse(self: *Parser, input: []const u8, visitor: anytype) !void {
         var lines = std.mem.splitAny(u8, input, "\n\r");
-        var line_num: usize = 0;
 
         while (lines.next()) |line| {
-            line_num += 1;
             const trimmed = std.mem.trim(u8, line, " \t");
             if (trimmed.len == 0) continue;
             if (trimmed[0] == '#' or trimmed[0] == ';') continue;
@@ -123,6 +107,10 @@ pub const Parser = struct {
             var pts = std.ArrayListUnmanaged(Point){};
             errdefer pts.deinit(self.allocator);
 
+            // Consume pairs until the field is empty or non-numeric. A
+            // malformed coordinate silently truncates the polyline rather than
+            // failing the whole parse — intentional for forward-compat with
+            // ASTM files that have trailing commas or optional extra fields.
             while (it.next()) |val| {
                 const x_str = std.mem.trim(u8, val, " ");
                 if (x_str.len == 0) break;
@@ -133,6 +121,9 @@ pub const Parser = struct {
             }
 
             const points = try pts.toOwnedSlice(self.allocator);
+            // Closed detection: ASTM convention is to repeat the first point
+            // as the last. Exact equality is intentional — the parser produces
+            // both from the same literal string, so there is no rounding drift.
             const closed = points.len > 2 and
                 points[0].x == points[points.len - 1].x and
                 points[0].y == points[points.len - 1].y;
@@ -228,6 +219,7 @@ pub const Parser = struct {
             var pts = std.ArrayListUnmanaged(Point){};
             errdefer pts.deinit(self.allocator);
 
+            // Same silent-truncation policy as PL records (see above).
             while (it.next()) |val| {
                 const x_str = std.mem.trim(u8, val, " ");
                 if (x_str.len == 0) break;
@@ -296,6 +288,7 @@ const TestVisitor = struct {
     last_header: ?Header = null,
     last_marker: ?Marker = null,
     last_piece: ?Piece = null,
+    last_polyline: ?Polyline = null,
 
     pub fn visitHeader(self: *TestVisitor, h: *const Header) !void {
         self.headers += 1;
@@ -309,8 +302,9 @@ const TestVisitor = struct {
         self.pieces += 1;
         self.last_piece = p.*;
     }
-    pub fn visitPolyline(self: *TestVisitor, _: *const Polyline) !void {
+    pub fn visitPolyline(self: *TestVisitor, pl: *const Polyline) !void {
         self.polylines += 1;
+        self.last_polyline = pl.*;
     }
     pub fn visitArc(self: *TestVisitor, _: *const Arc) !void {
         self.arcs += 1;
@@ -569,4 +563,110 @@ test "parse long form tags" {
 
     try testing.expectEqual(@as(usize, 1), visitor.headers);
     try testing.expectEqual(@as(usize, 1), visitor.markers);
+}
+
+test "polyline is closed when first and last points match" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(arena.allocator());
+    var visitor = TestVisitor{};
+
+    // quality=0, then 5 pairs: (0,0),(100,0),(100,100),(0,100),(0,0) — last repeats first
+    try parser.parse("PL,0,0,0,100,0,100,100,0,100,0,0", &visitor);
+
+    const pl = visitor.last_polyline.?;
+    try testing.expect(pl.closed);
+    try testing.expectEqual(@as(usize, 5), pl.points.len);
+    try testing.expectApproxEqAbs(@as(f64, 0), pl.points[0].x, 0.001);
+    try testing.expectApproxEqAbs(@as(f64, 0), pl.points[0].y, 0.001);
+    try testing.expectApproxEqAbs(@as(f64, 100), pl.points[1].x, 0.001);
+    try testing.expectApproxEqAbs(@as(f64, 0), pl.points[1].y, 0.001);
+}
+
+test "polyline is open when last point differs" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(arena.allocator());
+    var visitor = TestVisitor{};
+
+    try parser.parse("PL,0,0,0,100,0,100,100,0,100", &visitor);
+
+    try testing.expect(!visitor.last_polyline.?.closed);
+    try testing.expectEqual(@as(usize, 4), visitor.last_polyline.?.points.len);
+}
+
+test "piece grain angle and allowed rotation are parsed" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(arena.allocator());
+    var visitor = TestVisitor{};
+
+    // grain_angle=90, allowed_rotation=1 (rot_180)
+    try parser.parse("P,BACK-001,2,Denim,0,0,0,0,90,1,Back panel", &visitor);
+
+    const p = visitor.last_piece.?;
+    try testing.expectApproxEqAbs(@as(f64, 90), p.grain_angle, 0.001);
+    try testing.expectEqual(AllowedRotation.rot_180, p.allowed_rotation);
+}
+
+test "multiple pieces each trigger visitPiece" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(arena.allocator());
+    var visitor = TestVisitor{};
+
+    const input =
+        \\P,FRONT,1,Mat,0,0,0,0,0,0,
+        \\PL,0,0,0,50,0,50,50,0,50,0,0
+        \\P,BACK,1,Mat,0,0,0,0,0,0,
+        \\PL,0,0,0,60,0,60,60,0,60,0,0
+        \\EOF
+    ;
+    try parser.parse(input, &visitor);
+
+    try testing.expectEqual(@as(usize, 2), visitor.pieces);
+    try testing.expectEqual(@as(usize, 2), visitor.polylines);
+    try testing.expectEqualStrings("BACK", visitor.last_piece.?.id);
+}
+
+test "unknown tag is silently skipped" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(arena.allocator());
+    var visitor = TestVisitor{};
+
+    try parser.parse("H,ASTM,1.0,MM,Test,2026,Auth\nXXXUNKNOWN,foo,bar\nEOF", &visitor);
+
+    try testing.expectEqual(@as(usize, 1), visitor.headers);
+    try testing.expect(visitor.ended);
+}
+
+test "malformed coordinate truncates polyline without error" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(arena.allocator());
+    var visitor = TestVisitor{};
+
+    // Two valid pairs, then a non-numeric value — should yield 2 points, no error
+    try parser.parse("PL,0,0,0,100,0,BADVAL,200", &visitor);
+
+    try testing.expectEqual(@as(usize, 1), visitor.polylines);
+    try testing.expectEqual(@as(usize, 2), visitor.last_polyline.?.points.len);
+}
+
+test "invalid number on required field returns error" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var parser = Parser.init(arena.allocator());
+    var visitor = TestVisitor{};
+
+    // M record: width is required — passing a non-numeric string must error
+    try testing.expectError(error.InvalidNumber, parser.parse("M,ID,notanumber,3000,Mat,0,", &visitor));
 }

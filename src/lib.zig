@@ -24,12 +24,14 @@ pub const DrillHole = types.DrillHole;
 pub const TextAnnotation = types.TextAnnotation;
 pub const GrainLine = types.GrainLine;
 pub const SeamLine = types.SeamLine;
-pub const AstmDocument = types.AstmDocument;
 
 pub const Cmd = types.Cmd;
 pub const CmdKind = types.CmdKind;
 pub const visitCmd = types.visitCmd;
 
+// Pull in tests from sub-files. Zig only runs tests reachable from the root
+// source file, so we reference each module here to ensure their test blocks
+// are included when running `zig build test`.
 comptime {
     _ = @import("parser.zig");
     _ = @import("logger.zig");

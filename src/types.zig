@@ -22,7 +22,6 @@ pub const TextAnnotation = @import("types/text_annotation.zig").TextAnnotation;
 pub const GrainLine = @import("types/grain_line.zig").GrainLine;
 pub const SeamLine = @import("types/seam_line.zig").SeamLine;
 pub const Piece = @import("types/piece.zig").Piece;
-pub const AstmDocument = @import("types/astm_document.zig").AstmDocument;
 
 // Commandes et visiteur
 pub const CmdKind = @import("types/cmd.zig").CmdKind;
